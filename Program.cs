@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Diagnostics.Metrics;
 using System.IO;
+using System.Net.Mail;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using FirebirdSql.Data.FirebirdClient;
@@ -117,7 +119,14 @@ namespace DbMetaTool
                     .Where(f => Path.GetFileName(f).Contains("table", StringComparison.OrdinalIgnoreCase));
 
                 var procedureFiles = Directory.GetFiles(scriptsDirectory, "*.sql")
-                    .Where(f => Path.GetFileName(f).Contains("procedure", StringComparison.OrdinalIgnoreCase));
+                    .Where(f => Path.GetFileName(f).Contains("procedure", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(f =>
+                    {
+                        // dodatkowe sortowanie alfabetyczne
+                        var fileName = Path.GetFileNameWithoutExtension(f);
+                        var match = Regex.Match(fileName, @"procedure_(.+)_(\d+)");
+                        return match.Success ? int.Parse(match.Value) : int.MaxValue;
+                    });
 
                 // Domeny
                 foreach (var file in domainFiles)
@@ -134,7 +143,7 @@ namespace DbMetaTool
                 // Procedury
                 foreach (var file in procedureFiles)
                 {
-                    ExecuteSqlFile(file, connection, databaseDirectory, isProcedure:true);
+                    ExecuteSqlFile(file, connection, databaseDirectory, isProcedure: true);
                 }
 
                 // Raport
@@ -235,8 +244,8 @@ namespace DbMetaTool
 
                     string sqlType = fieldType switch
                     {
-                        7  => "SMALLINT",
-                        8  => "INTEGER",
+                        7 => "SMALLINT",
+                        8 => "INTEGER",
                         10 => "FLOAT",
                         12 => "DATE",
                         13 => "TIME",
@@ -246,7 +255,7 @@ namespace DbMetaTool
                         35 => "TIMESTAMP",
                         37 => $"VARCHAR({charLength})", // charset trzeba zmapować osobno
                         261 => "BLOB",
-                        _  => "UNKNOWN"
+                        _ => "UNKNOWN"
                     };
 
                     // pobierz inne właściwości i zapisz do listy
@@ -307,8 +316,8 @@ namespace DbMetaTool
 
                         string sqlType = fieldType switch
                         {
-                            7  => "SMALLINT",
-                            8  => "INTEGER",
+                            7 => "SMALLINT",
+                            8 => "INTEGER",
                             10 => "FLOAT",
                             12 => "DATE",
                             13 => "TIME",
@@ -318,7 +327,7 @@ namespace DbMetaTool
                             35 => "TIMESTAMP",
                             37 => "VARCHAR(" + charLength + ")",
                             261 => "BLOB",
-                            _  => "UNKNOWN"
+                            _ => "UNKNOWN"
                         };
 
                         string columnDef = $"{columnName} {sqlType}" +
@@ -369,7 +378,7 @@ namespace DbMetaTool
                                     constraints.Add($"CONSTRAINT {name} FOREIGN KEY ({field}) REFERENCES {referencedTable}({referencedField})");
                                     break;
                                 }
-                                
+
                             case "CHECK":
                                 constraints.Add($"CONSTRAINT {name} CHECK (...)");
                                 break;
@@ -390,7 +399,7 @@ namespace DbMetaTool
                     SELECT RDB$PROCEDURE_NAME, RDB$PROCEDURE_SOURCE
                     FROM RDB$PROCEDURES
                     WHERE RDB$SYSTEM_FLAG = 0";
-                
+
                 using var cmdProcedures = new FbCommand(sqlProcedures, connection);
                 using var readerProcedures = cmdProcedures.ExecuteReader();
                 while (readerProcedures.Read())
@@ -399,13 +408,28 @@ namespace DbMetaTool
                     string procSource = readerProcedures.IsDBNull(1) ? string.Empty : readerProcedures.GetString(1).Trim();
                     // pobierz parametry i ciało procedury, zapisz do listy
 
+                    // wykrywanie procedur wywolanych wewnatrz ciala procedury
+                    var calledProcedures = new List<string>();
+                    if (!string.IsNullOrEmpty(procSource))
+                    {
+                        var regex = new Regex(@"\bEXECUTE\s+PROCEDURE\s+(\w+)", RegexOptions.IgnoreCase);
+                        var matches = regex.Matches(procSource);
+                        foreach (Match match in matches)
+                        {
+                            if (match.Groups.Count > 1)
+                            {
+                                calledProcedures.Add(match.Groups[1].Value);
+                            }
+                        }
+                    }
+
                     string sqlParams = @"
                         SELECT p.RDB$PARAMETER_NAME, p.RDB$PARAMETER_TYPE, f.RDB$FIELD_TYPE, f.RDB$CHARACTER_LENGTH
                         FROM RDB$PROCEDURE_PARAMETERS p
                         JOIN RDB$FIELDS f ON p.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                         WHERE p.RDB$PROCEDURE_NAME = @procedureName
                         ORDER BY p.RDB$PARAMETER_NUMBER";
-                    
+
                     using var cmdParams = new FbCommand(sqlParams, connection);
                     cmdParams.Parameters.AddWithValue("@procedureName", procedureName);
                     var parameters = new List<ProcedureParameter>();
@@ -419,8 +443,8 @@ namespace DbMetaTool
 
                         string sqlType = fieldType switch
                         {
-                            7  => "SMALLINT",
-                            8  => "INTEGER",
+                            7 => "SMALLINT",
+                            8 => "INTEGER",
                             10 => "FLOAT",
                             12 => "DATE",
                             13 => "TIME",
@@ -430,7 +454,7 @@ namespace DbMetaTool
                             35 => "TIMESTAMP",
                             37 => $"VARCHAR({charLength})",
                             261 => "BLOB",
-                            _  => "UNKNOWN"
+                            _ => "UNKNOWN"
                         };
 
                         parameters.Add(new ProcedureParameter
@@ -445,7 +469,8 @@ namespace DbMetaTool
                     {
                         Name = procedureName,
                         Source = procSource,
-                        Parameters = parameters
+                        Parameters = parameters,
+                        CalledProcedures = calledProcedures
                     });
                 }
             }
@@ -465,17 +490,20 @@ namespace DbMetaTool
                              string.Join(",\n    ", table.Columns.Concat(table.Constraints ?? Enumerable.Empty<string>())) +
                              "\n);");
             }
-            
+
             File.WriteAllText(Path.Combine(outputDirectory, "tables.sql"), string.Join(Environment.NewLine, tableSql));
 
+
+            // Topologiczne sortowanie procedur wg zależności wywołań
+            var sortedProcedures = TopologicalSortProcedures(procedures);
             var procSql = new List<string>();
             int counter = 1;
-            foreach (var proc in procedures)
+            foreach (var proc in sortedProcedures)
             {
                 string paramList = "";
                 string returnsList = "";
 
-                if(proc.Parameters != null)
+                if (proc.Parameters != null)
                 {
                     var inParams = proc.Parameters.Where(p => !p.IsOutput).Select(p => $"{p.Name} {p.Type}");
                     var outParams = proc.Parameters.Where(p => p.IsOutput).Select(p => $"{p.Name} {p.Type}");
@@ -483,7 +511,7 @@ namespace DbMetaTool
                     paramList = inParams.Any() ? $"({string.Join(", ", inParams)})" : "";
                     returnsList = outParams.Any() ? $"RETURNS ({string.Join(", ", outParams)})" : "";
                 }
-                
+
                 string sql = $"CREATE OR ALTER PROCEDURE {proc.Name}";
 
                 if (!string.IsNullOrEmpty(paramList))
@@ -496,9 +524,47 @@ namespace DbMetaTool
 
                 procSql.Add(sql);
 
-                File.WriteAllText(Path.Combine(outputDirectory, $"procedures{counter}.sql"), string.Join(Environment.NewLine, sql));
-                counter++;
+                File.WriteAllText(Path.Combine(outputDirectory, $"procedure_{proc.Name}_{counter}.sql"), string.Join(Environment.NewLine, sql));
             }
+        }
+        public static List<ProcedureInfo> TopologicalSortProcedures(List<ProcedureInfo> procedures)
+        {
+            var result = new List<ProcedureInfo>();
+            var visited = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+            // mapa procedur po nazwie
+            var procMap = procedures.ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase);
+
+            void Visit(ProcedureInfo proc)
+            {
+                if (visited.TryGetValue(proc.Name, out var inProcess))
+                {
+                    if (inProcess)
+                        throw new InvalidOperationException($"Cykliczna zależność wykryta w procedurze {proc.Name}");
+                    return; // już odwiedzona
+                }
+
+                visited[proc.Name] = true; // oznacz jako "w trakcie"
+
+                foreach (var called in proc.CalledProcedures)
+                {
+                    if (procMap.TryGetValue(called, out var calledProc))
+                    {
+                        Visit(calledProc);
+                    }
+                    // jeśli procedura wywołuje coś, czego nie ma w liście, pomijamy
+                }
+
+                visited[proc.Name] = false; // oznacz jako "zakończona"
+                result.Add(proc);
+            }
+
+            foreach (var proc in procedures)
+            {
+                Visit(proc);
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -515,7 +581,7 @@ namespace DbMetaTool
 
             using var connection = new FbConnection(connectionString);
             connection.Open();
-            
+
             //transakcja dla bezpieczenstwa
             using var transaction = connection.BeginTransaction();
             try
@@ -529,23 +595,35 @@ namespace DbMetaTool
 
                 var procedureFiles = Directory.GetFiles(scriptsDirectory, "*.sql")
                     .Where(f => Path.GetFileName(f).Contains("procedure", StringComparison.OrdinalIgnoreCase));
+                var procedures = LoadProceduresFromFiles(procedureFiles);
+                var sortedProcedures = TopologicalSortProcedures(procedures);
 
                 // Domeny
                 foreach (var file in domainFiles)
                 {
-                    ExecuteSqlFileInUpdate(file, connection, transaction);
+                    ExecuteSqlDomainInUpdate(file, connection, transaction);
                 }
 
                 // Tabele
                 foreach (var file in tableFiles)
                 {
-                    ExecuteSqlFileInUpdate(file, connection, transaction);
+                    ExecuteSqlTableInUpdate(file, connection, transaction);
                 }
 
                 // Procedury
-                foreach (var file in procedureFiles)
+                // Procedury w poprawnej kolejności
+                foreach (var proc in sortedProcedures)
                 {
-                    ExecuteSqlFileInUpdate(file, connection, transaction, isProcedure:true);
+                    using var cmd = new FbCommand(proc.Source, connection, transaction);
+                    try
+                    {
+                        cmd.ExecuteNonQuery();
+                        Console.WriteLine($"Executed procedure: {proc.Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error in {proc.Name}: {ex.Message}");
+                    }
                 }
 
                 transaction.Commit();
@@ -556,46 +634,209 @@ namespace DbMetaTool
                 throw new InvalidOperationException("Database update failed.", ex);
             }
         }
-        static void ExecuteSqlFileInUpdate(string file, FbConnection connection, FbTransaction transaction, bool isProcedure = false)
+        static void ExecuteSqlTableInUpdate(string file, FbConnection connection, FbTransaction transaction)
         {
             string script = File.ReadAllText(file);
 
-            if (isProcedure)
+            var commands = script.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var command in commands)
             {
-                // Procedury wykonujemy jako całość
-                using var cmd = new FbCommand(script, connection, transaction);
+                string sql = command.Trim();
+                if (string.IsNullOrWhiteSpace(sql)) continue;
+
+                // CREATE TABLE
+                if (sql.StartsWith("CREATE TABLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"CREATE\s+TABLE\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        var tableName = match.Groups[1].Value;
+                        if (TableExists(connection, transaction, tableName))
+                        {
+                            Console.WriteLine($"Skipped CREATE TABLE {tableName} (already exists).");
+                            continue;
+                        }
+                    }
+                }
+                // DROP TABLE
+                else if (sql.StartsWith("DROP TABLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"DROP\s+TABLE\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        var tableName = match.Groups[1].Value;
+                        if (!TableExists(connection, transaction, tableName))
+                        {
+                            Console.WriteLine($"Skipped DROP TABLE {tableName} (does not exist).");
+                            continue;
+                        }
+                    }
+                }
+                // ALTER TABLE ADD COLUMN
+                else if (sql.StartsWith("ALTER TABLE", StringComparison.OrdinalIgnoreCase) &&
+                        sql.Contains("ADD", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"ALTER\s+TABLE\s+(\w+)\s+ADD\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        var tableName = match.Groups[1].Value;
+                        var columnName = match.Groups[2].Value;
+                        if (ColumnExists(connection, transaction, tableName, columnName))
+                        {
+                            Console.WriteLine($"Skipped ALTER TABLE {tableName} ADD {columnName} (already exists).");
+                            continue;
+                        }
+                    }
+                }
+                // ALTER TABLE DROP COLUMN
+                else if (sql.StartsWith("ALTER TABLE", StringComparison.OrdinalIgnoreCase) &&
+                        sql.Contains("DROP", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"ALTER\s+TABLE\s+(\w+)\s+DROP\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        var tableName = match.Groups[1].Value;
+                        var columnName = match.Groups[2].Value;
+                        if (!ColumnExists(connection, transaction, tableName, columnName))
+                        {
+                            Console.WriteLine($"Skipped ALTER TABLE {tableName} DROP {columnName} (does not exist).");
+                            continue;
+                        }
+                    }
+                }
+                // ALTER TABLE ALTER COLUMN TYPE
+                else if (sql.StartsWith("ALTER TABLE", StringComparison.OrdinalIgnoreCase) &&
+                        sql.Contains("ALTER", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"ALTER\s+TABLE\s+(\w+)\s+ALTER\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        var tableName = match.Groups[1].Value;
+                        var columnName = match.Groups[2].Value;
+                        if (!ColumnExists(connection, transaction, tableName, columnName))
+                        {
+                            Console.WriteLine($"Skipped ALTER TABLE {tableName} ALTER {columnName} (does not exist).");
+                            continue;
+                        }
+                    }
+                }
+
+                using var cmd = new FbCommand(sql, connection, transaction);
                 try
                 {
                     cmd.ExecuteNonQuery();
-                    Console.WriteLine($"Executed procedures from file: {Path.GetFileName(file)}");
+                    Console.WriteLine($"Executed: {Path.GetFileName(file)}");
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Error in {Path.GetFileName(file)}: {ex.Message}");
                 }
             }
-            else
-            {
-                // Domeny i tabele dzielimy po średnikach
-                var commands = script.Split(';', StringSplitOptions.RemoveEmptyEntries);
-                foreach (var command in commands)
-                {
-                    string sql = command.Trim();
-                    if (string.IsNullOrWhiteSpace(sql)) continue;
+        }
+        static void ExecuteSqlDomainInUpdate(string file, FbConnection connection, FbTransaction transaction)
+        {
+            string script = File.ReadAllText(file);
 
-                    using var cmd = new FbCommand(sql, connection, transaction);
-                    try
+            var commands = script.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var command in commands)
+            {
+                string sql = command.Trim();
+                if (string.IsNullOrWhiteSpace(sql)) continue;
+
+                //CREATE DOMAIN
+                if (sql.StartsWith("CREATE DOMAIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"CREATE\s+DOMAIN\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
                     {
-                        cmd.ExecuteNonQuery();
-                        Console.WriteLine($"Executed: {Path.GetFileName(file)}");
+                        var domainName = match.Groups[1].Value;
+                        if (DomainExists(connection, transaction, domainName))
+                        {
+                            Console.WriteLine($"Skipped CREATE DOMAIN {domainName} (already exists).");
+                            continue;
+                        }
                     }
-                    catch (Exception ex)
+                }
+                //ALTER DOMAIN
+                else if (sql.StartsWith("ALTER DOMAIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = Regex.Match(sql, @"ALTER\s+DOMAIN\s+(\w+)", RegexOptions.IgnoreCase);
+                    if (match.Success)
                     {
-                        Console.WriteLine($"Error in {Path.GetFileName(file)}: {ex.Message}");
+                        var domainName = match.Groups[1].Value;
+                        if (!DomainExists(connection, transaction, domainName))
+                        {
+                            Console.WriteLine($"Skipped ALTER DOMAIN {domainName} (does not exist).");
+                            continue;
+                        }
                     }
+                }
+
+                using var cmd = new FbCommand(sql, connection, transaction);
+                try
+                {
+                    cmd.ExecuteNonQuery();
+                    Console.WriteLine($"Executed: {Path.GetFileName(file)}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error in {Path.GetFileName(file)}: {ex.Message}");
                 }
             }
         }
+        public static bool DomainExists(FbConnection connection, FbTransaction transaction, string domainName)
+        {
+            string sql = "SELECT 1 FROM RDB$FIELDS WHERE RDB$FIELD_NAME = @domainName";
+            using var cmd = new FbCommand(sql, connection, transaction);
+            cmd.Parameters.AddWithValue("domainName", domainName.ToUpper());
+            return cmd.ExecuteScalar() != null;
+        }
+        public static bool TableExists(FbConnection connection, FbTransaction transaction, string tableName)
+        {
+            string sql = "SELECT 1 FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = @tableName AND RDB$SYSTEM_FLAG = 0";
+            using var cmd = new FbCommand(sql, connection, transaction);
+            cmd.Parameters.AddWithValue("tableName", tableName.ToUpper());
+            return cmd.ExecuteScalar() != null;
+        }
+        public static bool ColumnExists(FbConnection connection, FbTransaction transaction, string tableName, string columnName)
+        {
+            string sql = "SELECT 1 FROM RDB$RELATION_FIELDS WHERE RDB$RELATION_NAME = @tableName AND RDB$FIELD_NAME = @columnName";
+            using var cmd = new FbCommand(sql, connection, transaction);
+            cmd.Parameters.AddWithValue("tableName", tableName.ToUpper());
+            cmd.Parameters.AddWithValue("columnName", columnName.ToUpper());
+            return cmd.ExecuteScalar() != null;
+        }
+        static List<ProcedureInfo> LoadProceduresFromFiles(IEnumerable<string> files)
+        {
+            var procedures = new List<ProcedureInfo>();
+
+            foreach (var file in files)
+            {
+                string script = File.ReadAllText(file);
+
+                // znajdź nazwę procedury
+                var match = Regex.Match(script, @"CREATE\s+OR\s+ALTER\s+PROCEDURE\s+(\w+)", RegexOptions.IgnoreCase);
+                if (!match.Success) continue;
+
+                string procName = match.Groups[1].Value;
+
+                // znajdź wszystkie wywołania EXECUTE PROCEDURE
+                var called = Regex.Matches(script, @"EXECUTE\s+PROCEDURE\s+(\w+)", RegexOptions.IgnoreCase)
+                                .Select(m => m.Groups[1].Value)
+                                .Distinct()
+                                .ToList();
+
+                procedures.Add(new ProcedureInfo
+                {
+                    Name = procName,
+                    Source = script,
+                    CalledProcedures = called
+                });
+            }
+
+            return procedures;
+        }
+
     }
 }
 
@@ -612,6 +853,7 @@ public class ProcedureInfo
     public required string Name { get; set; }
     public required string Source { get; set; }
     public List<ProcedureParameter>? Parameters { get; set; }
+    public List<string> CalledProcedures { get; set; } = new();
 }
 
 public class ProcedureParameter
